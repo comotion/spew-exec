@@ -18,8 +18,10 @@
 #include <error.h>
 #include <errno.h>
 #include <sys/wait.h>
+#include <sys/epoll.h>
 
 #define BUF_SIZE 1024
+#define MAX_EVENTS 10
 
 struct sig { int num; char *name; } sigmap[] = {
 	{SIGHUP,  "SIGHUP"},
@@ -66,9 +68,11 @@ struct sig { int num; char *name; } sigmap[] = {
 	{0, NULL},
 };
 
-// global var of the executed child
+// global pid of the executed child
 pid_t child;
 int chin, chout;
+int epfd;
+struct epoll_event ev, events[MAX_EVENTS];
 
 int tok_args(char *args, char **argv)
 {
@@ -104,7 +108,7 @@ int cmd_exec(char *commandstring, char * const envp[]) {
 	}
 	if(0 != stat(path, &statbuf) || !S_ISREG(statbuf.st_mode) || !( S_IXUSR & statbuf.st_mode )){
 			printf("Couldn't execute %s: %s\n", path, strerror(errno));
-			exit(2);
+			return -1;
 	}
 	parsedargs[0] = path;
 	parsedargs[1] = NULL;
@@ -112,8 +116,8 @@ int cmd_exec(char *commandstring, char * const envp[]) {
 		tok_args(args, parsedargs +1);
 
 	// we need fd's to child to send stdin and capture stdout?
-	int outfd[2];
 	int infd[2];
+	int outfd[2];
 	if(pipe(infd) == -1) {
 		perror("pipe infd");
 		exit(2);
@@ -131,13 +135,14 @@ int cmd_exec(char *commandstring, char * const envp[]) {
 
 	if(child == 0) { // child
 		close(0);
-		// close(1); close(2);
-		close(infd[1]); // child only reads from infd
+	  //close(1); close(2);
+		dup(infd[0]); // child stdin = read end of inpipe
+		dup(outfd[1]); // stdout = write end of outpipe
+		dup(outfd[1]); // stderr
+		close(infd[1]);  // child only reads from infd
 		close(outfd[0]); // child only writes to outfd
-		dup(infd[0]); // child stdin from inpipe
-		//dup(outfd[1]); // stdout
-		//dup(outfd[1]); // stderr
-		printf("wuttf");
+		close(infd[0]);  // cleanup
+		close(outfd[1]);
 
 		int rc = execve(path, parsedargs, envp);
 		perror("execution failed");
@@ -149,14 +154,10 @@ int cmd_exec(char *commandstring, char * const envp[]) {
 		chout = outfd[0];
 		close(infd[0]); 
 		close(outfd[1]); 
-		/*
-		while(!feof(stdin)){
-			fgets(buf, sizeof(buf), stdin);
-			write(infd[1], buf, strlen(buf)+1);
-			read(outfd[0], buf, 20);
-			printf("%s", buf);
+		printf("HANDLE: %d/%d\n", chin, chout);
+		if(epoll_ctl(epfd, EPOLL_CTL_ADD, chout, &ev) == -1) {
+			perror("epoll_ctl");
 		}
-		*/
 	}
 }
 
@@ -178,6 +179,8 @@ int cmd_signal(char *buffer){
 void handlesig(int sig) {
 	if(sig == SIGPIPE){
 		printf("DEAD\n");
+	}else if(sig == SIGCHLD) {
+		printf("DYING\n");
 	}else{
 		printf("signal %d\n", sig);
 	}
@@ -186,28 +189,63 @@ void handlesig(int sig) {
 int main(int argc, char **argv, char * const envp[])
 {
 	signal(SIGPIPE, &handlesig);
-	// XXX: select read from various sources: running exec fd's and controlling program, 0mq..
+	signal(SIGCHLD, &handlesig);
+	epfd = epoll_create1(EPOLL_CLOEXEC);
+	if(epfd == -1) {
+		perror("epoll");
+		exit(EXIT_FAILURE);
+	}
+	ev.events = EPOLLIN | EPOLLOUT;
+	if(epoll_ctl(epfd, EPOLL_CTL_ADD, fileno(stdin), &ev) == -1) {
+		perror("epoll_ctl");
+	}
+
 	char buffer[BUF_SIZE];
-	while(!feof(stdin)) {
-		int status;
-		fgets(buffer, sizeof(buffer), stdin);
-		if(buffer[0] == '\0'){
-			continue;
-		}
-		if (0 == strncmp("EXEC ", buffer, 5)) {
-			cmd_exec(buffer+5, envp);
-		}
-		if (0 == strncmp("WRITE ", buffer, 6)) {
-			cmd_write(buffer+6);
-		}
-		if (0 == strncmp("SIGNAL ", buffer, 7)) {
-			cmd_signal(buffer+7);
-		}
-		if(waitpid(-1, &status, WNOHANG)){
-			if(WIFEXITED(status)){
-				printf("DIED\n");
+	for(;;) {
+		int nfds = epoll_wait(epfd, events, MAX_EVENTS, -1);
+		for(int n = 0; n < nfds; ++n) {
+			printf("FDs %d: [%d]: %d\n", nfds, n, events[n].data.fd);
+			if(events[n].data.fd == fileno(stdin)) {
+				// parse spew commands
+				int rbytes = read(events[n].data.fd, buffer, BUF_SIZE);
+				if(rbytes && rbytes < BUF_SIZE){
+					buffer[rbytes] = '\0';
+				}
+				if(buffer[0] == '\0'){
+					continue;
+				}
+				if (0 == strncmp("EXEC ", buffer, 5)) {
+					cmd_exec(buffer+5, envp);
+				}
+				if (0 == strncmp("WRITE ", buffer, 6)) {
+					cmd_write(buffer+6);
+				}
+				if (0 == strncmp("SIGNAL ", buffer, 7)) {
+					cmd_signal(buffer+7);
+				}
+				if (0 == strncmp("KILL", buffer, 5)) {
+					cmd_signal("SIGKILL");
+				}
+				if (0 == strncmp("TERM", buffer, 5)) {
+					cmd_signal("SIGTERM");
+				}
+			}else{
+				int rbytes = read(events[n].data.fd, buffer, BUF_SIZE);
+				if(rbytes && rbytes < BUF_SIZE){
+					buffer[rbytes] = '\0';
+				}
+				printf("%s", buffer);
 			}
+			printf("done %d\n", n);
 		}
 	}
 	printf("EOF\n");
+}
+void potentialthread() {
+	int status;
+	if(waitpid(-1, &status, WNOHANG)){
+		if(WIFEXITED(status)){
+			printf("DIED\n");
+		}
+	}
 }
