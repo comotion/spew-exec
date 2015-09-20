@@ -1,0 +1,26 @@
+spew-exec is a process manager for spew ( https://github.com/lafka/spew )
+
+Spew takes commands on stdin and forks processes that communicate with
+the calling process.
+
+Commands: 
+   EXEC /path/to/exec arguments
+     creates a child process,
+
+<- HANDLE x/y
+<- stdout
+<- stderr
+
+   WRITE blah
+
+     writes blah to stdin of child process
+ 
+  SIGNAL TERM
+     sends signal TERM to child
+
+<- DIED
+   
+      sent by spew-exec when child is dead/reaped.
+
+
+:
