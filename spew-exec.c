@@ -8,6 +8,12 @@
  signal SIGKILL -> to child
   <- DIED
 
+	- unix socket transport to spew
+  - daemonizes to decouple from parent
+	- debug mode supports commands on stdin
+
+	Kacper Wysocki, 2015-09-23,
+	released under the BSD 2-clause license.
 */
 
 #include <stdlib.h>
@@ -182,10 +188,19 @@ int cmd_exec(char *commandstring, char * const envp[]) {
 }
 
 int cmd_write(char *buffer){
-	write(chin, buffer, strlen(buffer));
+	if (TRACE) printf("write '%s'\n", buffer);
+	if(!child){
+		printf("DEAD\n");
+		return -1;
+	}
+	return write(chin, buffer, strlen(buffer));
 }
 
 int cmd_signal(char *buffer){
+	if(!child){
+		printf("DEAD\n");
+		return -1;
+	}
 	for(int i = 0; sigmap[i].name; i++){
 		if(0 == strncmp(sigmap[i].name, buffer, strlen(sigmap[i].name))){
 			kill(child, sigmap[i].num);
@@ -201,13 +216,40 @@ void handlesig(int sig) {
 		printf("DEAD\n");
 	}else if(sig == SIGCHLD) {
 		printf("DYING\n");
+		child = 0;
 	}else{
 		printf("signal %d\n", sig);
 	}
+	fflush(stdout);
+	fflush(stderr);
 }
 
 int main(int argc, char **argv, char * const envp[])
 {
+  int i, unixfd;
+	char *unixsock = NULL;
+	for(i = 1;i < argc; i++){
+		if(strncmp(argv[i], "-u", 3) == 0){
+			if( i + 1 == argc ){
+				fprintf(stderr, "ERROR: not enough args, path to unix socket needed\n");
+				exit(EXIT_FAILURE);
+			}
+			unixsock = argv[i + 1];
+			if (TRACE) printf("unix! : %s\n", unixsock);
+		}
+
+		if((strncmp(argv[i],"-h", 3) == 0) ||
+			 (strncmp(argv[i],"-help", 6) == 0) ||
+			 (strncmp(argv[i],"--help", 7) == 0) )
+		{
+		  printf("usage: spew-exec -u /path/to/unix/socket");
+
+			exit(1);
+		}
+			
+	}
+
+	/* set up epoll */
 	signal(SIGPIPE, &handlesig);
 	signal(SIGCHLD, &handlesig);
 	epfd = epoll_create1(EPOLL_CLOEXEC);
@@ -215,19 +257,77 @@ int main(int argc, char **argv, char * const envp[])
 		perror("epoll");
 		exit(EXIT_FAILURE);
 	}
-	ev.events = EPOLLIN | EPOLLOUT;
-	if(epoll_ctl(epfd, EPOLL_CTL_ADD, fileno(stdin), &ev) == -1) {
-		perror("epoll_ctl");
+	struct epoll_event ev;
+	
+
+	int oldout, olderr;
+	/* set up unix comms */
+	if(unixsock) {
+		unsigned int us;
+		struct sockaddr_un local, remote;
+		int len;
+		oldout = dup(1);
+		olderr = dup(2);
+		
+		if( (us = socket(AF_UNIX, SOCK_STREAM, 0)) == -1 ){
+			perror("socket");
+			exit(EXIT_FAILURE);
+		}
+		local.sun_family = AF_UNIX;
+		strcpy(local.sun_path, unixsock);
+		unlink(local.sun_path);
+		len = strlen(local.sun_path) + sizeof(local.sun_family);
+		if(bind(us, (struct sockaddr*) &local, len) == -1){
+			perror("bind");
+			exit(EXIT_FAILURE);
+		}
+		if(listen(us, 1) == -1){
+			perror("listen");
+			exit(EXIT_FAILURE);
+		}
+		/* daemonize - everything that could go wrong did before this point */
+		daemon(1, 1);
+
+		/* continue input on unix socket */
+		len = sizeof(struct sockaddr_un);
+		if ( (unixfd= accept(us, (struct sockaddr *) &remote, &len)) == -1) {
+			perror("accept");
+			exit(EXIT_FAILURE);
+		}
+		if (TRACE) printf("accepted!\n");
+		ev.data.fd = unixfd;
+		ev.events = EPOLLIN;
+
+		/* stdout and stderr now go on the unix socket */
+		dup2(unixfd,1);
+		dup2(unixfd,2);
+
+		if(epoll_ctl(epfd, EPOLL_CTL_ADD, unixfd, &ev) == -1) {
+			perror("epoll_ctl unixfd");
+			exit(EXIT_FAILURE);
+		}
+	}else{
+		if (TRACE) printf("adding stdin\n");
+		ev.data.fd = fileno(stdin);
+		ev.events = EPOLLIN;
+		if(epoll_ctl(epfd, EPOLL_CTL_ADD, fileno(stdin), &ev) == -1) {
+			perror("epoll_ctl");
+			exit(EXIT_FAILURE);
+		}
 	}
 
 	char buffer[BUF_SIZE];
 	for(;;) {
 		int nfds = epoll_wait(epfd, events, MAX_EVENTS, -1);
 		for(int n = 0; n < nfds; ++n) {
-			printf("FDs %d: [%d]: %d\n", nfds, n, events[n].data.fd);
-			if(events[n].data.fd == fileno(stdin)) {
+			if (TRACE) printf("FDs %d: [%d]: %d\n", nfds, n, events[n].data.fd);
+
+		  if((unixsock && events[n].data.fd == unixfd) || 
+				(!unixsock && events[n].data.fd == fileno(stdin)) ){
 				// parse spew commands
+				if (TRACE) printf("COMMAND READ..\n");
 				int rbytes = read(events[n].data.fd, buffer, BUF_SIZE);
+				if (TRACE) printf("read!");
 				if(rbytes && rbytes < BUF_SIZE){
 					buffer[rbytes] = '\0';
 				}
@@ -236,27 +336,36 @@ int main(int argc, char **argv, char * const envp[])
 				}
 				if (0 == strncmp("EXEC ", buffer, 5)) {
 					cmd_exec(buffer+5, envp);
-				}
+				} else
 				if (0 == strncmp("WRITE ", buffer, 6)) {
 					cmd_write(buffer+6);
-				}
+				} else
 				if (0 == strncmp("SIGNAL ", buffer, 7)) {
 					cmd_signal(buffer+7);
-				}
+				} else
 				if (0 == strncmp("KILL", buffer, 5)) {
 					cmd_signal("SIGKILL");
-				}
+				} else
 				if (0 == strncmp("TERM", buffer, 5)) {
 					cmd_signal("SIGTERM");
+				} else
+				if (0 == strncmp("QUIT", buffer, 4) || 0 == strncmp("EXIT", buffer, 4)) {
+					exit(0);
+				} else {
+					fprintf(stderr, "unrecognized command '%s'\n", buffer);
 				}
 			}else{
+				/* read from the child sockets */
+				if (TRACE) printf("CHILD SOCKET READ MAAN\n");
 				int rbytes = read(events[n].data.fd, buffer, BUF_SIZE);
+				if (TRACE) printf("read\n");
 				if(rbytes && rbytes < BUF_SIZE){
 					buffer[rbytes] = '\0';
 				}
-				printf("%s", buffer);
+				printf("OUT(%lu): %s", rbytes, buffer);
 			}
-			printf("done %d\n", n);
+			fflush(stdout);
+			fflush(stderr);
 		}
 	}
 	printf("EOF\n");
