@@ -13,15 +13,22 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
-#include <unistd.h>
-#include <sys/stat.h>
 #include <error.h>
 #include <errno.h>
+#include <unistd.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <sys/epoll.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 
 #define BUF_SIZE 1024
 #define MAX_EVENTS 10
+#ifndef TRACE
+#define TRACE 0
+#endif
+
 
 struct sig { int num; char *name; } sigmap[] = {
 	{SIGHUP,  "SIGHUP"},
@@ -72,15 +79,20 @@ struct sig { int num; char *name; } sigmap[] = {
 pid_t child;
 int chin, chout;
 int epfd;
-struct epoll_event ev, events[MAX_EVENTS];
+struct epoll_event  events[MAX_EVENTS];
 
 int tok_args(char *args, char **argv)
 {
+	if (TRACE) printf("tok_args! %s\n", args);
 	int i = 0;
 	char *p;
 	while( (p = strchr(args, ' ')) != NULL){
+		if (TRACE) printf("arg %d: %s\n", i, argv[i]);
 		argv[i++] = p + 1;
 	  *p = '\0';
+	}
+	if(i == 0) { // only one argument
+		argv[i++] = args;
 	}
 	argv[i] = NULL;
 	return i;
