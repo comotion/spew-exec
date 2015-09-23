@@ -112,11 +112,15 @@ int cmd_exec(char *commandstring, char * const envp[]) {
 		fprintf(stderr, "EXEC param too long, needs to be max %d bytes.\n", BUF_SIZE);
 		exit(1);
 	}
+
 	p = strchr(path, ' ');
 	// find arguments, if any
 	if(p){
 		*p = '\0';
 		args = p + 1;
+	}
+	if((p = strchr(path, '\n')) != NULL){
+			p = '\0';
 	}
 	if(0 != stat(path, &statbuf) || !S_ISREG(statbuf.st_mode) || !( S_IXUSR & statbuf.st_mode )){
 			printf("Couldn't execute %s: %s\n", path, strerror(errno));
@@ -146,15 +150,15 @@ int cmd_exec(char *commandstring, char * const envp[]) {
 	}
 
 	if(child == 0) { // child
-		close(0);
-	  //close(1); close(2);
-		dup(infd[0]); // child stdin = read end of inpipe
-		dup(outfd[1]); // stdout = write end of outpipe
-		dup(outfd[1]); // stderr
-		close(infd[1]);  // child only reads from infd
-		close(outfd[0]); // child only writes to outfd
-		close(infd[0]);  // cleanup
-		close(outfd[1]);
+		if(dup2(infd[0], 0) != STDIN_FILENO) {; // child stdin = read end of inpipe
+			perror("stdin if");
+		}
+    if(dup2(outfd[1], 1)!= STDOUT_FILENO) {;// stdout = write end of outpipe
+			perror("stdout if");
+ 	  }
+		//dup2(outfd[1], 2);// stderr = write end of outpipe
+		//close(infd[1]);  // child only reads from infd
+		//close(outfd[0]); // child only writes to outfd
 
 		int rc = execve(path, parsedargs, envp);
 		perror("execution failed");
@@ -164,9 +168,13 @@ int cmd_exec(char *commandstring, char * const envp[]) {
 		// parent reads  from outfd
 		chin = infd[1];
 		chout = outfd[0];
-		close(infd[0]); 
-		close(outfd[1]); 
-		printf("HANDLE: %d/%d\n", chin, chout);
+		//close(infd[0]); 
+		//close(outfd[1]); 
+		if (TRACE) printf("HANDLE: %d/%d\n", chin, chout);
+
+		struct epoll_event ev;
+		ev.data.fd = chout;
+		ev.events = EPOLLIN;
 		if(epoll_ctl(epfd, EPOLL_CTL_ADD, chout, &ev) == -1) {
 			perror("epoll_ctl");
 		}
